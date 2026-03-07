@@ -1,0 +1,14 @@
+# Neo4j driver
+neo4j==6.1.0
+
+# Ollama (Python client for local LLMs / embeddings)
+ollama==0.6.1
+
+# OpenRouter (OpenAI-compatible API for RAG chat model)
+openai>=1.0.0
+
+# PDF text extraction
+pypdf>=4.0.0
+
+# Testing
+pytest>=8.0.0
