@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import hashlib
 
 # Load .env if present (no extra dependency)
 _env_file = Path(__file__).resolve().parent / ".env"
@@ -145,10 +146,14 @@ def ingest(docs_path: Path | None = None) -> None:
             # Clear existing chunks so we can re-ingest idempotently
             session.run("MATCH (c:Chunk) DETACH DELETE c")
             for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
+                chunk_id = hashlib.sha256(chunk.encode()).hexdigest()
                 session.run(
                     """
-                    CREATE (c:Chunk {text: $text, embedding: $embedding, index: $index})
+                    MERGE (c:Chunk {chunk_id: $chunk_id})
+                    ON CREATE SET c.text = $text, c.embedding = $embedding, c.index = $index
+                    ON MATCH SET c.embedding = $embedding, c.index = $index
                     """,
+                    chunk_id=chunk_id,
                     text=chunk,
                     embedding=emb,
                     index=i,
