@@ -1,5 +1,6 @@
 """
 Graph RAG pipeline: PDFs from docs/ → chunk → embed (Ollama BGE-M3) → Neo4j → query & answer.
+Retrieval: hybrid search (vector similarity + full-text) combined with Reciprocal Rank Fusion (RRF).
 RAG answer: OpenRouter (if OPENROUTER_API_KEY set) or Ollama. Uses conda env: graph-rag.
 """
 from __future__ import annotations
@@ -32,8 +33,10 @@ EMBED_MODEL = "bge-m3"
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 40
 VECTOR_INDEX_NAME = "chunk_embeddings"
+FULLTEXT_INDEX_NAME = "chunk_fulltext"
 CHUNK_LABEL = "Chunk"
 BGE_M3_DIM = 1024
+RRF_K = 60  # Reciprocal Rank Fusion damping constant
 # RAG answer: OpenRouter (preferred when API key set) or Ollama
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "moonshotai/kimi-k2.5")
@@ -114,7 +117,6 @@ def get_neo4j_driver():
 def ensure_vector_index(driver) -> None:
     """Create vector index on Chunk.embedding if it does not exist."""
     with driver.session() as session:
-        # Neo4j 5.13+ vector index
         session.run(
             """
             CREATE VECTOR INDEX $name IF NOT EXISTS
@@ -126,6 +128,18 @@ def ensure_vector_index(driver) -> None:
             """,
             name=VECTOR_INDEX_NAME,
             dim=BGE_M3_DIM,
+        )
+
+
+def ensure_fulltext_index(driver) -> None:
+    """Create full-text index on Chunk.text for hybrid search."""
+    with driver.session() as session:
+        session.run(
+            """
+            CREATE FULLTEXT INDEX $name IF NOT EXISTS
+            FOR (c:Chunk) ON EACH [c.text]
+            """,
+            name=FULLTEXT_INDEX_NAME,
         )
 
 
@@ -142,6 +156,7 @@ def ingest(docs_path: Path | None = None) -> None:
     driver = get_neo4j_driver()
     try:
         ensure_vector_index(driver)
+        ensure_fulltext_index(driver)
         with driver.session() as session:
             # Clear existing chunks so we can re-ingest idempotently
             session.run("MATCH (c:Chunk) DETACH DELETE c")
@@ -167,9 +182,8 @@ def retrieve(driver, query: str, top_k: int = 5) -> list[tuple[str, float]]:
     vecs = embed_texts([query])
     query_vec = vecs[0]
     with driver.session() as session:
-        # db.index.vector.queryNodes(indexName, k, queryVector)
         result = session.run(
-            f"""
+            """
             CALL db.index.vector.queryNodes($index_name, $k, $query_vector)
             YIELD node, score
             RETURN node.text AS text, score
@@ -179,6 +193,50 @@ def retrieve(driver, query: str, top_k: int = 5) -> list[tuple[str, float]]:
             query_vector=query_vec,
         )
         return [(r["text"], r["score"]) for r in result]
+
+
+def retrieve_hybrid(
+    driver,
+    query: str,
+    top_k: int = 5,
+    rrf_k: int = RRF_K,
+) -> list[tuple[str, float]]:
+    """
+    Hybrid search: vector + full-text, combined with Reciprocal Rank Fusion (RRF).
+    RRF_score = 1/(k + rank_vector) + 1/(k + rank_keyword); missing branch contributes 0.
+    """
+    vecs = embed_texts([query])
+    query_vec = vecs[0]
+    with driver.session() as session:
+        result = session.run(
+            """
+            CALL () {
+                CALL db.index.vector.queryNodes($vector_index, $k, $query_vector)
+                YIELD node, score
+                WITH node, score ORDER BY score DESC
+                WITH collect(node) AS nodes
+                UNWIND range(0, size(nodes) - 1) AS rank
+                RETURN nodes[rank] AS node, rank AS rank
+                UNION
+                CALL db.index.fulltext.queryNodes($ft_index, $question) YIELD node, score
+                WITH node, score ORDER BY score DESC
+                WITH collect(node) AS nodes
+                UNWIND range(0, size(nodes) - 1) AS rank
+                RETURN nodes[rank] AS node, rank AS rank
+            }
+            WITH node, sum(1.0 / ($rrf_k + rank)) AS rrf_score
+            ORDER BY rrf_score DESC
+            LIMIT $k
+            RETURN node.text AS text, rrf_score
+            """,
+            vector_index=VECTOR_INDEX_NAME,
+            ft_index=FULLTEXT_INDEX_NAME,
+            question=query,
+            query_vector=query_vec,
+            k=top_k,
+            rrf_k=rrf_k,
+        )
+        return [(r["text"], r["rrf_score"]) for r in result]
 
 
 def _generate_answer(prompt: str) -> str:
@@ -197,10 +255,10 @@ def _generate_answer(prompt: str) -> str:
 
 
 def answer(query: str, top_k: int = 5) -> str:
-    """RAG: retrieve relevant chunks from Neo4j and generate answer (OpenRouter or Ollama)."""
+    """RAG: retrieve relevant chunks via hybrid search (vector + full-text, RRF) and generate answer."""
     driver = get_neo4j_driver()
     try:
-        hits = retrieve(driver, query, top_k=top_k)
+        hits = retrieve_hybrid(driver, query, top_k=top_k)
         if not hits:
             return "No relevant context found in the knowledge base."
         context = "\n\n".join(f"[{i+1}] {text}" for i, (text, _) in enumerate(hits))
