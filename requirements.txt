@@ -12,3 +12,8 @@ pypdf>=4.0.0
 
 # Testing
 pytest>=8.0.0
+
+
+docling>=2.9.0
+docling-core[chunking]>=2.8.0
+transformers>=4.40.0
